@@ -30,18 +30,20 @@ export function nextRequestId(): string {
 }
 
 export function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  return parseUrl(req).path;
 }
 
 export function queryOf(req: IncomingMessage): URLSearchParams {
+  return parseUrl(req).query;
+}
+
+/** Parse the request URL once: pathname + query params together. */
+export function parseUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
+    const u = new URL(req.url ?? '/', 'http://entry');
+    return { path: u.pathname, query: u.searchParams };
   } catch {
-    return new URLSearchParams();
+    return { path: '/', query: new URLSearchParams() };
   }
 }
 

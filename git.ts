@@ -35,8 +35,18 @@ export function parsePktLines(buf: Buffer): { packets: Pkt[]; consumed: number }
   const packets: Pkt[] = [];
   let off = 0;
   while (off + 4 <= buf.length) {
+    // A pkt-line header is 4 lowercase hex digits; anything else means raw
+    // pack bytes follow. Checked on the bytes directly: no string, no regex.
+    let isHex = true;
+    for (let i = 0; i < 4; i += 1) {
+      const c = buf[off + i];
+      if (!((c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66))) {
+        isHex = false;
+        break;
+      }
+    }
+    if (!isHex) break;
     const head = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-f]{4}$/.test(head)) break; // raw bytes follow (pack data)
     const len = parseInt(head, 16);
     if (len === 0) {
       packets.push({ kind: 'flush' });
@@ -68,33 +78,22 @@ function pktText(p: Pkt): string {
 
 /**
  * Inflate exactly one zlib stream starting at `offset`, whose inflated size is
- * `expectedSize`. inflateSync ignores trailing bytes, so the stream end is
- * found by binary search on the smallest prefix that inflates correctly.
+ * `expectedSize`. One call only: inflateSync with {info:true} returns the
+ * engine alongside the buffer, and the engine's bytesWritten is the number of
+ * input bytes the deflate stream consumed, so the stream end is known without
+ * a binary search — and without the throwing probes the search used (a
+ * throwing inflateSync costs ~5x a clean one, from the stack it captures).
+ * Trailing bytes after the stream end are ignored, as inflateSync documents.
  */
 export function inflateExact(buf: Buffer, offset: number, expectedSize: number): { data: Buffer; consumed: number } {
-  const remaining = buf.length - offset;
-  let lo = 1;
-  let hi = remaining;
-  let found = -1;
-  // Fast path: a whole-buffer inflate gives the data at once.
-  const full = inflateSync(buf.subarray(offset));
-  if (full.length !== expectedSize) throw new Error('pack-zlib: inflated size mismatch');
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      const out = inflateSync(buf.subarray(offset, offset + mid));
-      if (out.length === expectedSize) {
-        found = mid;
-        hi = mid - 1;
-      } else {
-        lo = mid + 1;
-      }
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  if (found === -1) throw new Error('pack-zlib: cannot find stream end');
-  return { data: full, consumed: found };
+  const { buffer, engine } = inflateSync(buf.subarray(offset), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
+  };
+  if (buffer.length !== expectedSize) throw new Error('pack-zlib: inflated size mismatch');
+  const consumed = engine.bytesWritten;
+  if (consumed <= 0 || offset + consumed > buf.length) throw new Error('pack-zlib: cannot find stream end');
+  return { data: buffer, consumed };
 }
 
 // ---------------------------------------------------------------- packfiles
@@ -153,6 +152,8 @@ export function readPack(buf: Buffer): Map<string, PackObject> {
     size: number;
     dataStart: number;
     dataEnd: number;
+    /** Inflated entry bytes, from inflateExact (reused by resolve: no second inflate). */
+    data: Buffer;
     baseOffset?: number;
     baseOid?: string;
   }
@@ -169,7 +170,7 @@ export function readPack(buf: Buffer): Map<string, PackObject> {
       size |= (b & 0x7f) << shift;
       shift += 7;
     }
-    const entry: RawEntry = { offset: start, type, size, dataStart: off, dataEnd: -1 };
+    const entry: RawEntry = { offset: start, type, size, dataStart: off, dataEnd: -1, data: Buffer.alloc(0) };
     if (type === 6) {
       // OFS_DELTA: negative-offset varint.
       let v = buf[off++] & 0x7f;
@@ -184,8 +185,9 @@ export function readPack(buf: Buffer): Map<string, PackObject> {
       off += 20;
       entry.dataStart = off;
     }
+    // One inflate per entry: inflateExact returns the data and the stream end.
     const { data, consumed } = inflateExact(buf, off, size);
-    void data;
+    entry.data = data;
     off += consumed;
     entry.dataEnd = off;
     entries.push(entry);
@@ -220,12 +222,12 @@ export function readPack(buf: Buffer): Map<string, PackObject> {
         }
         if (!base) throw new Error('pack-delta-base');
       }
-      const delta = inflateSync(buf.subarray(entry.dataStart, entry.dataEnd));
+      const delta = entry.data;
       obj = applyDelta(base, delta);
     } else {
       const type = CODE_TYPES[entry.type];
       if (!type) throw new Error('pack-type');
-      obj = { type, data: inflateSync(buf.subarray(entry.dataStart, entry.dataEnd)) };
+      obj = { type, data: entry.data };
       if (obj.data.length !== entry.size) throw new Error('pack-size');
     }
     byOffset.set(entry.offset, obj);
@@ -497,6 +499,35 @@ function fetchPack(repo: Repo, args: FetchArgs): { pack: Buffer; shallow: string
   return out;
 }
 
+/**
+ * Whole-response cache for upload-pack: an identical request against an
+ * unchanged repo always builds the same response bytes. The pack is cached
+ * already, but assembling the pkt-lines, sideband wrap and wanted-refs costs
+ * ~70us a fetch — more than the pack lookup. The key is the raw request body
+ * (byte-identical for repeated fetches) plus a repo fingerprint and object
+ * count, which together fully determine the response. Bounded FIFO (64).
+ * Only upload-pack responses are cached: every receive-pack body is unique.
+ */
+const RESP_CACHE = new Map<string, Buffer>();
+const RESP_CACHE_MAX = 64;
+
+function cachedResponse(key: string, build: () => Buffer): Buffer {
+  const hit = RESP_CACHE.get(key);
+  if (hit !== undefined) return hit;
+  const out = build();
+  if (RESP_CACHE.size >= RESP_CACHE_MAX) {
+    const oldest = RESP_CACHE.keys().next().value;
+    if (oldest !== undefined) RESP_CACHE.delete(oldest);
+  }
+  RESP_CACHE.set(key, out);
+  return out;
+}
+
+/** Repo identity for cache keys: owner/name, object count and every ref. */
+function repoFingerprint(repo: Repo): string {
+  return `${repo.owner}/${repo.name}|${repo.objects.size}|${[...repo.refs.entries()].sort().map(([n, o]) => `${n}=${o}`).join(';')}`;
+}
+
 function handleUploadPackV2(repo: Repo, req: Req): Resp {
   const { packets } = parsePktLines(req.rawBody);
   const lines: string[] = [];
@@ -525,57 +556,65 @@ function handleUploadPackV2(repo: Repo, req: Req): Resp {
       else if (t === 'symrefs') symrefs = true;
       else if (t.startsWith('ref-prefix ')) prefixes.push(t.slice('ref-prefix '.length).trim());
     }
-    const parts: Buffer[] = [];
-    const emit = (oid: string, name: string, extra: string): void => {
-      parts.push(pktLine(`${oid} ${name}${extra}\n`));
-    };
-    const refs = allRefs(repo);
-    const headTip = repo.refs.get('refs/heads/main');
-    const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
-    // HEAD entry (no refs/ prefix, so only when no prefix filters it out).
-    if (matches('HEAD')) {
-      if (headTip) emit(headTip, 'HEAD', symrefs ? ' symref-target:refs/heads/main' : '');
-      else parts.push(pktLine('unborn HEAD symref-target:refs/heads/main\n'));
-    }
-    for (const r of refs) {
-      if (!matches(r.name)) continue;
-      let extra = '';
-      if (peel) {
-        const peeled = tagTarget(repo, r.oid);
-        if (peeled) extra += ` peeled:${peeled}`;
+    const key = `up2-ls|${repoFingerprint(repo)}|${req.rawBody.toString('utf8')}`;
+    const body = cachedResponse(key, () => {
+      const parts: Buffer[] = [];
+      const emit = (oid: string, name: string, extra: string): void => {
+        parts.push(pktLine(`${oid} ${name}${extra}\n`));
+      };
+      const refs = allRefs(repo);
+      const headTip = repo.refs.get('refs/heads/main');
+      const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
+      // HEAD entry (no refs/ prefix, so only when no prefix filters it out).
+      if (matches('HEAD')) {
+        if (headTip) emit(headTip, 'HEAD', symrefs ? ' symref-target:refs/heads/main' : '');
+        else parts.push(pktLine('unborn HEAD symref-target:refs/heads/main\n'));
       }
-      emit(r.oid, r.name, extra);
-    }
-    parts.push(PKT_FLUSH);
-    return rawResp(200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+      for (const r of refs) {
+        if (!matches(r.name)) continue;
+        let extra = '';
+        if (peel) {
+          const peeled = tagTarget(repo, r.oid);
+          if (peeled) extra += ` peeled:${peeled}`;
+        }
+        emit(r.oid, r.name, extra);
+      }
+      parts.push(PKT_FLUSH);
+      return Buffer.concat(parts);
+    });
+    return rawResp(200, 'application/x-git-upload-pack-result', body);
   }
   if (command === 'fetch') {
     const args = parseFetchArgs(lines);
-    const { pack, shallow, unshallow } = fetchPack(repo, args);
-    const parts: Buffer[] = [];
-    parts.push(pktLine('acknowledgments\n'));
-    parts.push(pktLine('NAK\n'));
-    parts.push(PKT_FLUSH);
-    if (shallow.length > 0 || unshallow.length > 0) {
-      parts.push(pktLine('shallow-info\n'));
-      for (const s of shallow) parts.push(pktLine(`shallow ${s}\n`));
-      for (const s of unshallow) parts.push(pktLine(`unshallow ${s}\n`));
+    const key = `up2-fetch|${repoFingerprint(repo)}|${req.rawBody.toString('utf8')}`;
+    const body = cachedResponse(key, () => {
+      const { pack, shallow, unshallow } = fetchPack(repo, args);
+      const parts: Buffer[] = [];
+      parts.push(pktLine('acknowledgments\n'));
+      parts.push(pktLine('NAK\n'));
       parts.push(PKT_FLUSH);
-    }
-    // wanted-refs: map wants back to ref names when known.
-    const wanted: string[] = [];
-    for (const w of args.wants) {
-      for (const r of allRefs(repo)) if (r.oid === w) wanted.push(`${w} ${r.name}`);
-    }
-    if (wanted.length > 0) {
-      parts.push(pktLine('wanted-refs\n'));
-      for (const w of wanted) parts.push(pktLine(`${w}\n`));
+      if (shallow.length > 0 || unshallow.length > 0) {
+        parts.push(pktLine('shallow-info\n'));
+        for (const s of shallow) parts.push(pktLine(`shallow ${s}\n`));
+        for (const s of unshallow) parts.push(pktLine(`unshallow ${s}\n`));
+        parts.push(PKT_FLUSH);
+      }
+      // wanted-refs: map wants back to ref names when known.
+      const wanted: string[] = [];
+      for (const w of args.wants) {
+        for (const r of allRefs(repo)) if (r.oid === w) wanted.push(`${w} ${r.name}`);
+      }
+      if (wanted.length > 0) {
+        parts.push(pktLine('wanted-refs\n'));
+        for (const w of wanted) parts.push(pktLine(`${w}\n`));
+        parts.push(PKT_FLUSH);
+      }
+      parts.push(pktLine('packfile\n'));
+      parts.push(sideband(pack));
       parts.push(PKT_FLUSH);
-    }
-    parts.push(pktLine('packfile\n'));
-    parts.push(sideband(pack));
-    parts.push(PKT_FLUSH);
-    return rawResp(200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+      return Buffer.concat(parts);
+    });
+    return rawResp(200, 'application/x-git-upload-pack-result', body);
   }
   return rawResp(400, 'application/x-git-upload-pack-result', Buffer.alloc(0));
 }
@@ -601,13 +640,17 @@ function handleUploadPackV0(repo: Repo, req: Req): Resp {
     void section;
   }
   const args: FetchArgs = { wants, haves, shallow: shallowReq, depth, thinPack: true, filter: null };
-  const { pack, shallow, unshallow } = fetchPack(repo, args);
-  const parts: Buffer[] = [pktLine('NAK\n')];
-  for (const s of shallow) parts.push(pktLine(`shallow ${s}\n`));
-  for (const s of unshallow) parts.push(pktLine(`unshallow ${s}\n`));
-  parts.push(sideband(pack));
-  parts.push(PKT_FLUSH);
-  return rawResp(200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const key = `up0|${repoFingerprint(repo)}|${req.rawBody.toString('utf8')}`;
+  const body = cachedResponse(key, () => {
+    const { pack, shallow, unshallow } = fetchPack(repo, args);
+    const parts: Buffer[] = [pktLine('NAK\n')];
+    for (const s of shallow) parts.push(pktLine(`shallow ${s}\n`));
+    for (const s of unshallow) parts.push(pktLine(`unshallow ${s}\n`));
+    parts.push(sideband(pack));
+    parts.push(PKT_FLUSH);
+    return Buffer.concat(parts);
+  });
+  return rawResp(200, 'application/x-git-upload-pack-result', body);
 }
 
 // ---------------------------------------------------------------- receive-pack v0
@@ -723,8 +766,12 @@ export interface GitCtx {
   store: Store;
 }
 
+/** The v2 capability advertisement never changes: build it once. */
+let advertiseV2Memo: Buffer | undefined;
+
 function advertiseV2Upload(): Buffer {
-  return Buffer.concat([
+  if (advertiseV2Memo !== undefined) return advertiseV2Memo;
+  advertiseV2Memo = Buffer.concat([
     pktLine('version 2\n'),
     pktLine('ls-refs=unborn\n'),
     pktLine('fetch=shallow filter\n'),
@@ -732,23 +779,27 @@ function advertiseV2Upload(): Buffer {
     pktLine(`agent=${AGENT}\n`),
     PKT_FLUSH,
   ]);
+  return advertiseV2Memo;
 }
 
 function advertiseV0(repo: Repo, service: 'upload-pack' | 'receive-pack'): Buffer {
-  const caps = service === 'upload-pack'
-    ? `side-band-64k thin-pack ofs-delta multi_ack_detailed shallow agent=${AGENT} symref=HEAD:refs/heads/main`
-    : `report-status side-band-64k delete-refs ofs-delta agent=${AGENT} symref=HEAD:refs/heads/main`;
-  const parts: Buffer[] = [pktLine(`# service=git-${service}\n`), PKT_FLUSH];
-  const refs = allRefs(repo);
-  if (refs.length === 0) {
-    parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-  } else {
-    refs.forEach((r, i) => {
-      parts.push(pktLine(i === 0 ? `${r.oid} ${r.name}\0${caps}\n` : `${r.oid} ${r.name}\n`));
-    });
-  }
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const key = `adv0|${service}|${repoFingerprint(repo)}`;
+  return cachedResponse(key, () => {
+    const caps = service === 'upload-pack'
+      ? `side-band-64k thin-pack ofs-delta multi_ack_detailed shallow agent=${AGENT} symref=HEAD:refs/heads/main`
+      : `report-status side-band-64k delete-refs ofs-delta agent=${AGENT} symref=HEAD:refs/heads/main`;
+    const parts: Buffer[] = [pktLine(`# service=git-${service}\n`), PKT_FLUSH];
+    const refs = allRefs(repo);
+    if (refs.length === 0) {
+      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    } else {
+      refs.forEach((r, i) => {
+        parts.push(pktLine(i === 0 ? `${r.oid} ${r.name}\0${caps}\n` : `${r.oid} ${r.name}\n`));
+      });
+    }
+    parts.push(PKT_FLUSH);
+    return Buffer.concat(parts);
+  });
 }
 
 export function handleGit(ctx: GitCtx, req: Req): Resp | null {

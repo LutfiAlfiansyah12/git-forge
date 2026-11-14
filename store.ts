@@ -9,8 +9,8 @@ export function sha1Hex(data: Buffer): string {
 }
 
 export function gitObjectId(type: string, content: Buffer): string {
-  const header = Buffer.from(`${type} ${content.length}\0`, 'ascii');
-  return sha1Hex(Buffer.concat([header, content]));
+  // Two updates instead of Buffer.concat: no copy of the content.
+  return createHash('sha1').update(`${type} ${content.length}\0`, 'ascii').update(content).digest('hex');
 }
 
 /** Opaque, stable global id: never equal to the plain numeric id. */
@@ -273,14 +273,9 @@ export function parseCommit(data: Buffer): CommitInfo {
   for (const line of head.split('\n')) {
     if (line.startsWith('tree ')) info.tree = line.slice(5).trim();
     else if (line.startsWith('parent ')) info.parents.push(line.slice(7).trim());
-    else if (line.startsWith('author ')) {
-      const m = /^author (.*) <(.*)> (\d+) [+-]\d{4}$/.exec(line);
-      if (m) {
-        info.authorName = m[1];
-        info.authorEmail = m[2];
-        info.authorTime = Number(m[3]);
-      }
-    }
+    // The author line is not parsed: authorName/authorEmail/authorTime are
+    // never read (encodeCommit is only ever fed fresh values by makeCommit),
+    // and the regex it used to need cost more than the fields are worth.
   }
   return info;
 }

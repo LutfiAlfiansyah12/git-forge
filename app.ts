@@ -8,7 +8,7 @@ import { handleGit, type GitCtx } from './git.ts';
 import { handleGraphql, type GraphqlCtx } from './graphql.ts';
 import { handleMcp, type McpCtx } from './mcp.ts';
 import {
-  pathOf, queryOf, readBody, parseJsonBody, sendJson, sendEmpty, sendRaw, type Req,
+  parseUrl, readBody, parseJsonBody, sendJson, sendEmpty, sendRaw, type Req,
 } from './http.ts';
 
 export function createApp(): Server {
@@ -21,7 +21,7 @@ export function createApp(): Server {
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
-      const path = pathOf(req);
+      const { path, query } = parseUrl(req);
       const method = req.method ?? 'GET';
 
       // The env's boot probe: 200 {"ok":true}, no auth.
@@ -41,7 +41,13 @@ export function createApp(): Server {
           sendJson(res, 400, { message: 'Bad Request: could not read request body' });
           return;
         }
-        const parsed = parseJsonBody(rawBody);
+        // Git smart-HTTP bodies are pkt-lines + pack bytes, never JSON: parsing
+        // them as JSON would toString the buffer and throw on every push/fetch.
+        // Every other surface posts JSON, so only the git content type skips it.
+        const contentType = req.headers['content-type'] ?? '';
+        const parsed = contentType.startsWith('application/x-git-')
+          ? { json: undefined, jsonError: false }
+          : parseJsonBody(rawBody);
         json = parsed.json;
         jsonError = parsed.jsonError;
       }
@@ -66,7 +72,7 @@ export function createApp(): Server {
         method,
         path,
         segments,
-        query: queryOf(req),
+        query,
         headers: req.headers,
         host,
         rawBody,
